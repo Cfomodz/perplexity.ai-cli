@@ -56,6 +56,33 @@ class PerplexityResponse:
         return asdict(self)
 
 
+# Available models in Perplexity Pro mode
+# These names must match EXACTLY what appears in the UI dropdown
+AVAILABLE_MODELS = {
+    # Default (auto-select best model)
+    "auto": "Best",
+    "best": "Best",
+    # Perplexity's own model
+    "sonar": "Sonar",
+    # OpenAI models
+    "gpt": "GPT-5.1",
+    "gpt-5": "GPT-5.1",
+    "gpt-5.1": "GPT-5.1",
+    "o3-pro": "o3-pro",
+    # Anthropic models
+    "claude": "Claude Sonnet 4.5",
+    "claude-sonnet": "Claude Sonnet 4.5",
+    "claude-opus": "Claude Opus 4.5",
+    # Google models
+    "gemini": "Gemini 3 Pro",
+    "gemini-pro": "Gemini 3 Pro",
+    # xAI
+    "grok": "Grok 4.1",
+    # Moonshot
+    "kimi": "Kimi K2 Thinking",
+}
+
+
 # ---------------------------------------------------------------------------
 # Browser Automation
 # ---------------------------------------------------------------------------
@@ -339,6 +366,9 @@ class PerplexityBrowser:
         query: str,
         focus: str = "internet",
         pro_mode: bool = False,
+        model: Optional[str] = None,
+        research_mode: bool = False,
+        labs_mode: bool = False,
         timeout: int = 60,
     ) -> PerplexityResponse:
         """
@@ -348,6 +378,9 @@ class PerplexityBrowser:
             query: The question to ask.
             focus: Search focus ('internet', 'academic', 'writing', 'wolfram', 'youtube', 'reddit').
             pro_mode: Use Pro/Copilot mode if available.
+            model: Specific model to use (requires Pro). See AVAILABLE_MODELS.
+            research_mode: Use Research mode for deep, multi-step research.
+            labs_mode: Use Labs mode for experimental features.
             timeout: Maximum seconds to wait for response.
         
         Returns:
@@ -355,9 +388,16 @@ class PerplexityBrowser:
         """
         await self.start()
         
-        # Navigate to new thread
+        # Navigate to Perplexity
         await self._page.goto(self.PERPLEXITY_URL, wait_until="domcontentloaded", timeout=60000)
         await asyncio.sleep(3)
+        
+        # Select search mode (Search / Research / Labs) - this should be visible immediately
+        if labs_mode:
+            await self._select_search_mode("studio")  # Labs is called "studio" internally
+        elif research_mode:
+            await self._select_search_mode("research")
+        # else: default is "search" mode, already selected
         
         # Find the input - Perplexity uses a contenteditable div, not a textarea
         # The main input has id="ask-input" and role="textbox"
@@ -385,9 +425,23 @@ class PerplexityBrowser:
         if not input_element:
             raise RuntimeError("Could not find input element. Page may not have loaded correctly.")
         
-        # Click to focus the input
+        # Click to focus the input (this makes the toolbar with model selector visible)
         await input_element.click()
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.5)
+        
+        # Now select model/focus/pro mode (toolbar should be visible after input click)
+        if model and model != "auto":
+            await self._select_model(model)
+        
+        if pro_mode and not model:
+            await self._enable_pro_mode()
+        
+        if focus and focus != "internet":
+            await self._select_focus(focus)
+        
+        # Click input again to ensure focus for typing
+        await input_element.click()
+        await asyncio.sleep(0.2)
         
         # For contenteditable divs, we need to type character by character
         # Using fill() doesn't work well with Lexical editor
@@ -398,17 +452,195 @@ class PerplexityBrowser:
         # Submit with Enter
         await self._page.keyboard.press("Enter")
         
-        print("  Query submitted, waiting for response...")
+        mode_str = "Labs mode" if labs_mode else "Research mode" if research_mode else f"Model: {model}" if model else "Standard"
+        print(f"  Query submitted ({mode_str}), waiting for response...")
+        
+        # Research/Labs mode takes longer - adjust timeout
+        effective_timeout = timeout * 3 if (research_mode or labs_mode) else timeout
         
         # Wait for response to complete
-        response_text = await self._wait_for_response(timeout)
+        response_text = await self._wait_for_response(effective_timeout)
         references = await self._extract_references()
         
         return PerplexityResponse(
             answer=response_text,
             references=references,
             query=query,
+            model=model,
         )
+    
+    async def _select_search_mode(self, mode: str):
+        """
+        Select the search mode: 'search', 'research', or 'studio' (labs).
+        
+        Uses the segmented control with data-testid="search-mode-{mode}".
+        """
+        mode_names = {"search": "Search", "research": "Research", "studio": "Labs"}
+        print(f"  Selecting mode: {mode_names.get(mode, mode)}")
+        
+        # The mode buttons have data-testid="search-mode-{mode}" inside them
+        # The clickable button is the parent with role="radio"
+        selectors = [
+            # Direct testid on the inner div
+            f'[data-testid="search-mode-{mode}"]',
+            # Parent button with the value attribute
+            f'button[value="{mode}"]',
+            # Parent button with aria-label
+            f'button[aria-label="{mode_names.get(mode, mode)}"]',
+        ]
+        
+        for selector in selectors:
+            try:
+                element = await self._page.query_selector(selector)
+                if element:
+                    # If we got the inner div, get the parent button
+                    tag_name = await element.evaluate("el => el.tagName.toLowerCase()")
+                    if tag_name != "button":
+                        # Click the parent button instead
+                        parent = await element.evaluate_handle("el => el.closest('button')")
+                        if parent:
+                            await parent.click()
+                            print(f"    Mode selected via parent: {mode_names.get(mode, mode)}")
+                            await asyncio.sleep(0.5)
+                            return
+                    else:
+                        await element.click()
+                        print(f"    Mode selected: {mode_names.get(mode, mode)}")
+                        await asyncio.sleep(0.5)
+                        return
+            except Exception as e:
+                continue
+        
+        print(f"    Warning: Could not find mode selector for '{mode}'")
+    
+    async def _select_model(self, model: str):
+        """Select a specific model from the model selector dropdown."""
+        model_display_name = AVAILABLE_MODELS.get(model, model)
+        print(f"  Selecting model: {model_display_name}")
+        
+        # Model selector button - the aria-label shows the currently selected model name
+        # So we need to look for buttons with known model names in aria-label
+        known_model_labels = [
+            "Best", "Sonar", "GPT", "Claude", "Gemini", "Grok", "Kimi", "o3",
+            "Choose a model",  # fallback if no model selected
+        ]
+        
+        model_button = None
+        try:
+            buttons = await self._page.query_selector_all('button[aria-label]')
+            for btn in buttons:
+                label = await btn.get_attribute('aria-label')
+                if label:
+                    # Check if this button's label matches any known model name
+                    for model_label in known_model_labels:
+                        if model_label in label:
+                            model_button = btn
+                            print(f"    Found model button with label: {label}")
+                            break
+                    if model_button:
+                        break
+        except Exception as e:
+            print(f"    Error finding model button: {e}")
+        
+        if not model_button:
+            print(f"    Warning: Could not find model selector. Using default model.")
+            return
+        
+        # Click to open dropdown
+        await model_button.click()
+        await asyncio.sleep(0.5)
+        
+        # Look for the model option in the dropdown
+        # The dropdown has role="menu" with role="menuitem" children
+        # Each menuitem contains a span with the model name
+        model_option = None
+        
+        # First, try to find by exact text match in menuitem
+        try:
+            # Get all menuitems
+            menuitems = await self._page.query_selector_all('[role="menuitem"]')
+            for item in menuitems:
+                # Get the text content of the span inside
+                text = await item.inner_text()
+                # Clean up the text (remove "new", "max" badges, etc.)
+                text_clean = text.split('\n')[0].strip()
+                if text_clean == model_display_name:
+                    model_option = item
+                    print(f"    Found model option: {model_display_name}")
+                    break
+        except Exception as e:
+            print(f"    Error searching menuitems: {e}")
+        
+        # Fallback selectors if direct search failed
+        if not model_option:
+            fallback_selectors = [
+                f'[role="menuitem"]:has-text("{model_display_name}")',
+                f'[role="menu"] span:text-is("{model_display_name}")',
+            ]
+            for selector in fallback_selectors:
+                try:
+                    model_option = await self._page.query_selector(selector)
+                    if model_option:
+                        print(f"    Found model option via fallback: {selector}")
+                        break
+                except:
+                    continue
+        
+        if model_option:
+            await model_option.click()
+            await asyncio.sleep(0.3)
+            print(f"    Model selected: {model_display_name}")
+        else:
+            print(f"    Warning: Could not find model option for '{model_display_name}'")
+            # Press Escape to close dropdown
+            await self._page.keyboard.press("Escape")
+    
+    async def _enable_pro_mode(self):
+        """Enable Pro/Copilot mode if available."""
+        pro_selectors = [
+            '[data-testid="pro-toggle"]',
+            '[data-testid="copilot-toggle"]',
+            'button[aria-label*="Pro"]',
+            'button[aria-label*="Copilot"]',
+            '[class*="pro-toggle"]',
+            'input[type="checkbox"][name*="pro"]',
+        ]
+        
+        for selector in pro_selectors:
+            try:
+                toggle = await self._page.query_selector(selector)
+                if toggle:
+                    # Check if it's already enabled
+                    is_checked = await toggle.get_attribute("aria-checked")
+                    if is_checked != "true":
+                        await toggle.click()
+                        print("  Pro mode enabled")
+                    return
+            except:
+                continue
+        
+        print("  Note: Pro mode toggle not found (may already be enabled or unavailable)")
+    
+    async def _select_focus(self, focus: str):
+        """Select a specific focus mode."""
+        focus_selectors = [
+            f'[data-testid="focus-{focus}"]',
+            f'button[aria-label*="{focus}"]',
+            f'[class*="focus"][class*="{focus}"]',
+        ]
+        
+        for selector in focus_selectors:
+            try:
+                focus_btn = await self._page.query_selector(selector)
+                if focus_btn:
+                    await focus_btn.click()
+                    print(f"  Focus mode set: {focus}")
+                    await asyncio.sleep(0.3)
+                    return
+            except:
+                continue
+        
+        print(f"  Note: Focus mode '{focus}' selector not found")
     
     async def _wait_for_response(self, timeout: int) -> str:
         """Wait for response to complete and extract text."""
@@ -574,6 +806,9 @@ if FastAPI:
         query: str
         focus: str = "internet"
         pro_mode: bool = False
+        model: Optional[str] = None  # Model selection (e.g., "gpt-4o", "claude-sonnet", "sonar")
+        research_mode: bool = False  # Deep research mode
+        labs_mode: bool = False  # Labs mode for experimental features
         timeout: int = 60
     
     class QueryResponse(BaseModel):
@@ -600,11 +835,21 @@ if FastAPI:
         if not await _browser.is_logged_in():
             raise HTTPException(status_code=401, detail="Not logged in. Run with --login first.")
         
+        # Validate model if provided
+        if request.model and request.model not in AVAILABLE_MODELS:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Invalid model '{request.model}'. Available: {', '.join(AVAILABLE_MODELS.keys())}"
+            )
+        
         try:
             response = await _browser.ask(
                 query=request.query,
                 focus=request.focus,
                 pro_mode=request.pro_mode,
+                model=request.model,
+                research_mode=request.research_mode,
+                labs_mode=request.labs_mode,
                 timeout=request.timeout,
             )
             return QueryResponse(**response.to_dict())
@@ -625,11 +870,30 @@ if FastAPI:
         q: str,
         focus: str = "internet",
         pro_mode: bool = False,
+        model: Optional[str] = None,
+        research: bool = False,
+        labs: bool = False,
         timeout: int = 60,
     ):
         """GET endpoint for simple queries."""
-        request = QueryRequest(query=q, focus=focus, pro_mode=pro_mode, timeout=timeout)
+        request = QueryRequest(
+            query=q, 
+            focus=focus, 
+            pro_mode=pro_mode, 
+            model=model,
+            research_mode=research,
+            labs_mode=labs,
+            timeout=timeout
+        )
         return await _process_ask_request(request)
+    
+    @app.get("/models")
+    async def list_models():
+        """List available models for selection."""
+        return {
+            "models": list(AVAILABLE_MODELS.keys()),
+            "descriptions": AVAILABLE_MODELS,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -672,12 +936,39 @@ def render_references(refs: List[Dict[str, str]]):
             print(f"      {tColor.blue}{url}{tColor.reset}")
 
 
-async def cli_ask(browser: PerplexityBrowser, query: str, show_refs: bool = True, typing_delay: float = 0.02):
+async def cli_ask(
+    browser: PerplexityBrowser, 
+    query: str, 
+    show_refs: bool = True, 
+    typing_delay: float = 0.02,
+    model: Optional[str] = None,
+    research_mode: bool = False,
+    labs_mode: bool = False,
+    focus: str = "internet",
+):
     """CLI: Ask a single question."""
-    print(f"{tColor.bold}Asking:{tColor.reset} {query}\n")
+    mode_info = []
+    if labs_mode:
+        mode_info.append(f"{tColor.yellow}Labs{tColor.reset}")
+    elif research_mode:
+        mode_info.append(f"{tColor.purple}Research{tColor.reset}")
+    if model:
+        model_name = AVAILABLE_MODELS.get(model, model)
+        mode_info.append(f"{tColor.aqua}{model_name}{tColor.reset}")
+    if focus != "internet":
+        mode_info.append(f"Focus: {focus}")
+    
+    mode_str = f" [{', '.join(mode_info)}]" if mode_info else ""
+    print(f"{tColor.bold}Asking:{tColor.reset} {query}{mode_str}\n")
     
     try:
-        response = await browser.ask(query)
+        response = await browser.ask(
+            query, 
+            model=model, 
+            research_mode=research_mode,
+            labs_mode=labs_mode,
+            focus=focus,
+        )
         render_answer(response.answer, typing_delay=typing_delay)
         if show_refs:
             render_references(response.references)
@@ -686,14 +977,50 @@ async def cli_ask(browser: PerplexityBrowser, query: str, show_refs: bool = True
         sys.exit(1)
 
 
-async def cli_interactive(browser: PerplexityBrowser, typing_delay: float = 0.02):
+async def cli_interactive(
+    browser: PerplexityBrowser, 
+    typing_delay: float = 0.02,
+    model: Optional[str] = None,
+    research_mode: bool = False,
+    labs_mode: bool = False,
+    focus: str = "internet",
+):
     """CLI: Interactive mode."""
     print(f"{tColor.bold}Perplexity AI Bridge{tColor.reset} - Interactive Mode")
-    print("Type your question and press Enter. Type 'exit' to quit.\n")
+    
+    # Show current settings
+    settings = []
+    if model:
+        settings.append(f"Model: {AVAILABLE_MODELS.get(model, model)}")
+    if labs_mode:
+        settings.append("Labs Mode")
+    elif research_mode:
+        settings.append("Research Mode")
+    if focus != "internet":
+        settings.append(f"Focus: {focus}")
+    if settings:
+        print(f"Settings: {', '.join(settings)}")
+    
+    print("Type your question and press Enter. Type 'exit' to quit.")
+    print("Commands: /model <name>, /research, /labs, /focus <mode>, /help\n")
+    
+    current_model = model
+    current_research = research_mode
+    current_labs = labs_mode
+    current_focus = focus
     
     while True:
         try:
-            print(f"{tColor.bold}❯{tColor.reset} ", end="")
+            prompt_parts = []
+            if current_model:
+                prompt_parts.append(f"{tColor.aqua}{current_model}{tColor.reset}")
+            if current_labs:
+                prompt_parts.append(f"{tColor.yellow}L{tColor.reset}")
+            elif current_research:
+                prompt_parts.append(f"{tColor.purple}R{tColor.reset}")
+            prompt_prefix = f"[{'/'.join(prompt_parts)}] " if prompt_parts else ""
+            
+            print(f"{prompt_prefix}{tColor.bold}❯{tColor.reset} ", end="")
             query = input().strip()
             
             if not query:
@@ -701,7 +1028,51 @@ async def cli_interactive(browser: PerplexityBrowser, typing_delay: float = 0.02
             if query.lower() in ("exit", "quit", "q"):
                 break
             
-            response = await browser.ask(query)
+            # Handle commands
+            if query.startswith("/"):
+                parts = query.split(maxsplit=1)
+                cmd = parts[0].lower()
+                arg = parts[1] if len(parts) > 1 else ""
+                
+                if cmd == "/model":
+                    if arg in AVAILABLE_MODELS:
+                        current_model = arg if arg != "auto" else None
+                        print(f"  Model set to: {AVAILABLE_MODELS.get(arg, arg) or 'auto'}")
+                    else:
+                        print(f"  Available models: {', '.join(AVAILABLE_MODELS.keys())}")
+                elif cmd == "/research":
+                    current_research = not current_research
+                    if current_research:
+                        current_labs = False  # Mutually exclusive
+                    print(f"  Research mode: {'ON' if current_research else 'OFF'}")
+                elif cmd == "/labs":
+                    current_labs = not current_labs
+                    if current_labs:
+                        current_research = False  # Mutually exclusive
+                    print(f"  Labs mode: {'ON' if current_labs else 'OFF'}")
+                elif cmd == "/focus":
+                    if arg in ["internet", "academic", "writing", "wolfram", "youtube", "reddit"]:
+                        current_focus = arg
+                        print(f"  Focus set to: {current_focus}")
+                    else:
+                        print("  Available: internet, academic, writing, wolfram, youtube, reddit")
+                elif cmd == "/help":
+                    print("  /model <name>  - Set model (e.g., gpt-4o, claude-sonnet)")
+                    print("  /research      - Toggle research mode")
+                    print("  /labs          - Toggle labs mode")
+                    print("  /focus <mode>  - Set focus (internet, academic, etc.)")
+                    print("  /help          - Show this help")
+                else:
+                    print(f"  Unknown command: {cmd}")
+                continue
+            
+            response = await browser.ask(
+                query,
+                model=current_model,
+                research_mode=current_research,
+                labs_mode=current_labs,
+                focus=current_focus,
+            )
             render_answer(response.answer, typing_delay=typing_delay)
             render_references(response.references)
             print()
@@ -745,8 +1116,27 @@ Examples:
   # Ask a question (launches new browser)
   %(prog)s "What is quantum computing?"
   
-  # Interactive mode
+  # Use a specific model (requires Pro subscription)
+  %(prog)s --model gpt-4o "Explain relativity"
+  %(prog)s -m claude-sonnet "Write a poem"
+  
+  # Use Research mode for deep research
+  %(prog)s --research "History of quantum computing"
+  %(prog)s -r "Compare modern AI architectures"
+  
+  # Use Labs mode for experimental features
+  %(prog)s --labs "Build me a chart of stock prices"
+  %(prog)s -l "Create a presentation about AI"
+  
+  # Combine model and focus
+  %(prog)s -m sonar -f academic "Latest fusion research"
+  
+  # Interactive mode (with live model switching)
   %(prog)s -i
+  %(prog)s -i -m gpt-4o  # Start with GPT-4o
+  
+  # List available models
+  %(prog)s --list-models
   
   # Login in new browser profile
   %(prog)s --login
@@ -754,8 +1144,11 @@ Examples:
   # Start HTTP API server
   %(prog)s --serve
   
-  # Then query via HTTP:
+  # Query via HTTP:
   curl "http://localhost:8000/ask?q=What+is+AI"
+  curl "http://localhost:8000/ask?q=Deep+topic&research=true"
+  curl "http://localhost:8000/ask?q=Build+a+chart&labs=true"
+  curl "http://localhost:8000/ask?q=Question&model=gpt-4o"
 
 To use your existing logged-in session:
   1. Close your browser
@@ -785,8 +1178,30 @@ To use your existing logged-in session:
                         help="Path to browser profile directory")
     parser.add_argument("--no-typing", action="store_true",
                         help="Disable typing animation")
+    parser.add_argument("--model", "-m", type=str, default=None,
+                        choices=list(AVAILABLE_MODELS.keys()),
+                        help="Model to use (requires Pro). Options: " + ", ".join(AVAILABLE_MODELS.keys()))
+    parser.add_argument("--research", "-r", action="store_true",
+                        help="Use Research mode for deep, multi-step research")
+    parser.add_argument("--labs", "-l", action="store_true",
+                        help="Use Labs mode for experimental features")
+    parser.add_argument("--focus", "-f", type=str, default="internet",
+                        choices=["internet", "academic", "writing", "wolfram", "youtube", "reddit"],
+                        help="Search focus mode (default: internet)")
+    parser.add_argument("--list-models", action="store_true",
+                        help="List available models and exit")
     
     args = parser.parse_args()
+    
+    # List models and exit
+    if args.list_models:
+        print(f"{tColor.bold}Available Models:{tColor.reset}")
+        for key, name in AVAILABLE_MODELS.items():
+            if name:
+                print(f"  {tColor.aqua}{key:20}{tColor.reset} → {name}")
+            else:
+                print(f"  {tColor.aqua}{key:20}{tColor.reset} → (auto-select)")
+        return
     
     # Server mode
     if args.serve:
@@ -817,10 +1232,25 @@ To use your existing logged-in session:
         
         # Interactive mode
         if args.interactive or not args.query:
-            await cli_interactive(browser, typing_delay=typing_delay)
+            await cli_interactive(
+                browser, 
+                typing_delay=typing_delay,
+                model=args.model,
+                research_mode=args.research,
+                labs_mode=args.labs,
+                focus=args.focus,
+            )
         else:
             # Single query
-            await cli_ask(browser, args.query, typing_delay=typing_delay)
+            await cli_ask(
+                browser, 
+                args.query, 
+                typing_delay=typing_delay,
+                model=args.model,
+                research_mode=args.research,
+                labs_mode=args.labs,
+                focus=args.focus,
+            )
     
     finally:
         await browser.stop()
