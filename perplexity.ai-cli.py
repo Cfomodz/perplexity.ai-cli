@@ -592,13 +592,8 @@ if FastAPI:
             "version": __version__,
         }
     
-    @app.post("/ask", response_model=QueryResponse)
-    async def ask(request: QueryRequest):
-        """
-        Ask a question to Perplexity.
-        
-        Returns the answer and source references.
-        """
+    async def _process_ask_request(request: QueryRequest) -> QueryResponse:
+        """Shared logic for processing ask requests."""
         if not _browser:
             raise HTTPException(status_code=503, detail="Browser not initialized")
         
@@ -616,6 +611,15 @@ if FastAPI:
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
     
+    @app.post("/ask", response_model=QueryResponse)
+    async def ask(request: QueryRequest):
+        """
+        Ask a question to Perplexity.
+        
+        Returns the answer and source references.
+        """
+        return await _process_ask_request(request)
+    
     @app.get("/ask")
     async def ask_get(
         q: str,
@@ -625,7 +629,7 @@ if FastAPI:
     ):
         """GET endpoint for simple queries."""
         request = QueryRequest(query=q, focus=focus, pro_mode=pro_mode, timeout=timeout)
-        return await ask(request)
+        return await _process_ask_request(request)
 
 
 # ---------------------------------------------------------------------------
