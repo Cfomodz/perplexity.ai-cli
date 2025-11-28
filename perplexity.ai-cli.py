@@ -668,13 +668,13 @@ def render_references(refs: List[Dict[str, str]]):
             print(f"      {tColor.blue}{url}{tColor.reset}")
 
 
-async def cli_ask(browser: PerplexityBrowser, query: str, show_refs: bool = True):
+async def cli_ask(browser: PerplexityBrowser, query: str, show_refs: bool = True, typing_delay: float = 0.02):
     """CLI: Ask a single question."""
     print(f"{tColor.bold}Asking:{tColor.reset} {query}\n")
     
     try:
         response = await browser.ask(query)
-        render_answer(response.answer)
+        render_answer(response.answer, typing_delay=typing_delay)
         if show_refs:
             render_references(response.references)
     except Exception as e:
@@ -682,7 +682,7 @@ async def cli_ask(browser: PerplexityBrowser, query: str, show_refs: bool = True
         sys.exit(1)
 
 
-async def cli_interactive(browser: PerplexityBrowser):
+async def cli_interactive(browser: PerplexityBrowser, typing_delay: float = 0.02):
     """CLI: Interactive mode."""
     print(f"{tColor.bold}Perplexity AI Bridge{tColor.reset} - Interactive Mode")
     print("Type your question and press Enter. Type 'exit' to quit.\n")
@@ -698,7 +698,7 @@ async def cli_interactive(browser: PerplexityBrowser):
                 break
             
             response = await browser.ask(query)
-            render_answer(response.answer)
+            render_answer(response.answer, typing_delay=typing_delay)
             render_references(response.references)
             print()
             
@@ -808,12 +808,15 @@ To use your existing logged-in session:
             print(f"  {sys.argv[0]} --login")
             sys.exit(1)
         
+        # Determine typing delay
+        typing_delay = 0 if args.no_typing else 0.02
+        
         # Interactive mode
         if args.interactive or not args.query:
-            await cli_interactive(browser)
+            await cli_interactive(browser, typing_delay=typing_delay)
         else:
             # Single query
-            await cli_ask(browser, args.query)
+            await cli_ask(browser, args.query, typing_delay=typing_delay)
     
     finally:
         await browser.stop()
