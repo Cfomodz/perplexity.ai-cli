@@ -370,6 +370,7 @@ class PerplexityBrowser:
         research_mode: bool = False,
         labs_mode: bool = False,
         timeout: int = 60,
+        use_paste: bool = False,
     ) -> PerplexityResponse:
         """
         Ask a question and get the response.
@@ -382,6 +383,7 @@ class PerplexityBrowser:
             research_mode: Use Research mode for deep, multi-step research.
             labs_mode: Use Labs mode for experimental features.
             timeout: Maximum seconds to wait for response.
+            use_paste: Use clipboard paste instead of typing (faster, preserves newlines).
         
         Returns:
             PerplexityResponse with answer and references.
@@ -443,9 +445,17 @@ class PerplexityBrowser:
         await input_element.click()
         await asyncio.sleep(0.2)
         
-        # For contenteditable divs, we need to type character by character
-        # Using fill() doesn't work well with Lexical editor
-        await self._page.keyboard.type(query, delay=20)
+        if use_paste:
+            # Use clipboard paste - faster and preserves newlines
+            await self._page.evaluate(f"navigator.clipboard.writeText({json.dumps(query)})")
+            await asyncio.sleep(0.1)
+            # Ctrl+V to paste
+            await self._page.keyboard.press("Control+v")
+            await asyncio.sleep(0.3)
+        else:
+            # For contenteditable divs, we need to type character by character
+            # Using fill() doesn't work well with Lexical editor
+            await self._page.keyboard.type(query, delay=20)
         
         await asyncio.sleep(0.5)
         
@@ -945,6 +955,7 @@ async def cli_ask(
     research_mode: bool = False,
     labs_mode: bool = False,
     focus: str = "internet",
+    use_paste: bool = False,
 ):
     """CLI: Ask a single question."""
     mode_info = []
@@ -968,6 +979,7 @@ async def cli_ask(
             research_mode=research_mode,
             labs_mode=labs_mode,
             focus=focus,
+            use_paste=use_paste,
         )
         render_answer(response.answer, typing_delay=typing_delay)
         if show_refs:
@@ -984,6 +996,7 @@ async def cli_interactive(
     research_mode: bool = False,
     labs_mode: bool = False,
     focus: str = "internet",
+    use_paste: bool = False,
 ):
     """CLI: Interactive mode."""
     print(f"{tColor.bold}Perplexity AI Bridge{tColor.reset} - Interactive Mode")
@@ -1072,6 +1085,7 @@ async def cli_interactive(
                 research_mode=current_research,
                 labs_mode=current_labs,
                 focus=current_focus,
+                use_paste=use_paste,
             )
             render_answer(response.answer, typing_delay=typing_delay)
             render_references(response.references)
@@ -1178,6 +1192,8 @@ To use your existing logged-in session:
                         help="Path to browser profile directory")
     parser.add_argument("--no-typing", action="store_true",
                         help="Disable typing animation")
+    parser.add_argument("--paste", action="store_true",
+                        help="Use clipboard paste instead of typing (faster, preserves formatting)")
     parser.add_argument("--model", "-m", type=str, default=None,
                         choices=list(AVAILABLE_MODELS.keys()),
                         help="Model to use (requires Pro). Options: " + ", ".join(AVAILABLE_MODELS.keys()))
@@ -1239,6 +1255,7 @@ To use your existing logged-in session:
                 research_mode=args.research,
                 labs_mode=args.labs,
                 focus=args.focus,
+                use_paste=args.paste,
             )
         else:
             # Single query
@@ -1250,6 +1267,7 @@ To use your existing logged-in session:
                 research_mode=args.research,
                 labs_mode=args.labs,
                 focus=args.focus,
+                use_paste=args.paste,
             )
     
     finally:

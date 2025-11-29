@@ -1,2 +1,6 @@
 ppl-ai-venv
 cURL.sh
+
+# Orchestrator temp/output directories
+temp/
+orchestrator-output/
