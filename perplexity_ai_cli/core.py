@@ -2150,5 +2150,10 @@ To use your existing logged-in session:
         await browser.stop()
 
 
-if __name__ == "__main__":
+def cli_main():
+    """Synchronous entry point for CLI."""
     asyncio.run(main())
+
+
+if __name__ == "__main__":
+    cli_main()
