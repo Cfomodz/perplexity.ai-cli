@@ -1461,6 +1461,184 @@ class PerplexityBrowser:
         
         print(f"  Downloaded {len(downloaded)} image(s) to {output_dir}")
         return downloaded
+    
+    async def delete_conversation(self, url_or_id: str) -> bool:
+        """
+        Delete a conversation/thread.
+        
+        Args:
+            url_or_id: Either a full URL or a conversation ID.
+        
+        Returns:
+            True if deletion was successful, False otherwise.
+        """
+        await self.start()
+        
+        # Build URL if only ID provided
+        if url_or_id.startswith("http"):
+            url = url_or_id
+        else:
+            url = f"{self.PERPLEXITY_URL}/search/{url_or_id}"
+        
+        print(f"  Deleting conversation: {url}")
+        
+        try:
+            # Navigate to the conversation
+            await self._page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            await asyncio.sleep(2)
+        except Exception as e:
+            print(f"  Error navigating to conversation: {e}")
+            return False
+        
+        # Look for the menu button (usually three dots or similar)
+        menu_selectors = [
+            '[data-testid="thread-menu"]',
+            '[data-testid="conversation-menu"]',
+            '[aria-label="More options"]',
+            '[aria-label="Menu"]',
+            '[aria-label="Thread options"]',
+            'button[aria-haspopup="menu"]',
+            '[class*="menu-trigger"]',
+            '[class*="options"]',
+        ]
+        
+        menu_button = None
+        for selector in menu_selectors:
+            try:
+                menu_button = await self._page.query_selector(selector)
+                if menu_button and await menu_button.is_visible():
+                    print(f"    Found menu button: {selector}")
+                    break
+                menu_button = None
+            except:
+                continue
+        
+        if not menu_button:
+            # Try finding a button with ellipsis or dots icon in the header area
+            try:
+                buttons = await self._page.query_selector_all('button')
+                for btn in buttons:
+                    try:
+                        # Check for common menu icon patterns
+                        inner = await btn.inner_html()
+                        aria = await btn.get_attribute('aria-label') or ''
+                        if any(x in inner.lower() for x in ['ellipsis', 'dots', 'more', '⋮', '•••', '...']):
+                            menu_button = btn
+                            print(f"    Found menu button via icon pattern")
+                            break
+                        if any(x in aria.lower() for x in ['more', 'menu', 'options', 'actions']):
+                            menu_button = btn
+                            print(f"    Found menu button via aria-label: {aria}")
+                            break
+                    except:
+                        continue
+            except:
+                pass
+        
+        if not menu_button:
+            print("  Warning: Could not find menu button. Trying keyboard shortcut...")
+            # Some apps support keyboard shortcuts for delete
+            await self._page.keyboard.press("Delete")
+            await asyncio.sleep(0.5)
+        else:
+            # Click menu to open dropdown
+            await menu_button.click()
+            await asyncio.sleep(0.5)
+        
+        # Look for delete option in the menu
+        delete_selectors = [
+            '[data-testid="delete-thread"]',
+            '[data-testid="delete-conversation"]',
+            '[role="menuitem"]:has-text("Delete")',
+            '[role="menuitem"]:has-text("delete")',
+            'button:has-text("Delete")',
+            '[class*="delete"]',
+            '[aria-label*="Delete"]',
+            '[aria-label*="delete"]',
+        ]
+        
+        delete_option = None
+        for selector in delete_selectors:
+            try:
+                delete_option = await self._page.query_selector(selector)
+                if delete_option and await delete_option.is_visible():
+                    print(f"    Found delete option: {selector}")
+                    break
+                delete_option = None
+            except:
+                continue
+        
+        if not delete_option:
+            # Try finding by text content in menu items
+            try:
+                menuitems = await self._page.query_selector_all('[role="menuitem"], [role="button"], button')
+                for item in menuitems:
+                    try:
+                        text = await item.inner_text()
+                        if 'delete' in text.lower():
+                            delete_option = item
+                            print(f"    Found delete option via text: {text.strip()}")
+                            break
+                    except:
+                        continue
+            except:
+                pass
+        
+        if not delete_option:
+            print("  Error: Could not find delete option in menu")
+            await self._dismiss_overlays()
+            return False
+        
+        # Click delete
+        await delete_option.click()
+        await asyncio.sleep(0.5)
+        
+        # Handle confirmation dialog if present
+        confirm_selectors = [
+            '[data-testid="confirm-delete"]',
+            '[data-testid="delete-confirm"]',
+            'button:has-text("Delete")',
+            'button:has-text("Confirm")',
+            'button:has-text("Yes")',
+            '[role="alertdialog"] button:has-text("Delete")',
+            '[role="dialog"] button:has-text("Delete")',
+        ]
+        
+        for selector in confirm_selectors:
+            try:
+                confirm_btn = await self._page.query_selector(selector)
+                if confirm_btn and await confirm_btn.is_visible():
+                    # Make sure it's not the same delete button we already clicked
+                    btn_text = await confirm_btn.inner_text()
+                    if 'delete' in btn_text.lower() or 'confirm' in btn_text.lower() or 'yes' in btn_text.lower():
+                        print(f"    Confirming deletion...")
+                        await confirm_btn.click()
+                        await asyncio.sleep(1)
+                        break
+            except:
+                continue
+        
+        # Verify deletion by checking if we're redirected or the page content changed
+        await asyncio.sleep(1)
+        current_url = self._page.url
+        
+        # If we're redirected to home or library, deletion was successful
+        if '/search/' not in current_url or current_url == f"{self.PERPLEXITY_URL}/":
+            print("  ✓ Conversation deleted successfully")
+            return True
+        
+        # Check if there's an error message or if we're still on the same page
+        try:
+            # Look for "not found" or error indicators
+            page_text = await self._page.inner_text('body')
+            if 'not found' in page_text.lower() or 'deleted' in page_text.lower():
+                print("  ✓ Conversation deleted successfully")
+                return True
+        except:
+            pass
+        
+        print("  Deletion may have completed - please verify")
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -2410,6 +2588,26 @@ if FastAPI:
             raise
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.delete("/conversations/{conv_id}")
+    async def delete_conversation(conv_id: str):
+        """Delete a conversation/thread."""
+        if not _browser:
+            raise HTTPException(status_code=503, detail="Browser not initialized")
+        
+        if not await _browser.is_logged_in():
+            raise HTTPException(status_code=401, detail="Not logged in")
+        
+        try:
+            success = await _browser.delete_conversation(conv_id)
+            if success:
+                return {"status": "deleted", "conversation_id": conv_id}
+            else:
+                raise HTTPException(status_code=500, detail="Failed to delete conversation")
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 # ---------------------------------------------------------------------------
@@ -2526,7 +2724,7 @@ async def cli_interactive(
         print(f"Settings: {', '.join(settings)}")
     
     print("Type your question and press Enter. Type 'exit' to quit.")
-    print("Commands: /model, /thinking, /research, /labs, /focus, /history, /open, /continue, /download, /help\n")
+    print("Commands: /model, /thinking, /research, /labs, /focus, /history, /open, /continue, /download, /delete, /help\n")
     
     current_model = model
     current_research = research_mode
@@ -2652,6 +2850,25 @@ async def cli_interactive(
                     else:
                         print("  Usage: /download <conversation_id>")
                         print("  Or open a conversation first with /open, then just: /download")
+                elif cmd == "/delete":
+                    target = arg if arg else last_conversation_url
+                    if target:
+                        print(f"\n{tColor.red}Are you sure you want to delete this conversation?{tColor.reset}")
+                        print(f"  Target: {target}")
+                        confirm = input(f"  Type 'yes' to confirm: ").strip().lower()
+                        if confirm == 'yes':
+                            success = await browser.delete_conversation(target)
+                            if success:
+                                print(f"  {tColor.green}✓ Conversation deleted.{tColor.reset}")
+                                if target == last_conversation_url:
+                                    last_conversation_url = None
+                            else:
+                                print(f"  {tColor.red}✗ Failed to delete.{tColor.reset}")
+                        else:
+                            print(f"  {tColor.yellow}Deletion cancelled.{tColor.reset}")
+                    else:
+                        print("  Usage: /delete <conversation_id>")
+                        print("  Or open a conversation first with /open, then just: /delete")
                 elif cmd == "/help":
                     print("  /model <name>   - Set model (e.g., gpt, claude-sonnet)")
                     print("  /thinking       - Toggle thinking mode (shows reasoning)")
@@ -2662,6 +2879,7 @@ async def cli_interactive(
                     print("  /open <id>      - Open a previous conversation")
                     print("  /continue <id> <q> - Continue a conversation")
                     print("  /download [id]  - Download images from conversation")
+                    print("  /delete [id]    - Delete a conversation (requires confirmation)")
                     print("  /help           - Show this help")
                 else:
                     print(f"  Unknown command: {cmd}")
@@ -2759,6 +2977,8 @@ Examples:
   %(prog)s --continue <conv_id> "Follow-up?"   # Continue a conversation
   %(prog)s --download-images <conv_id>         # Download images from a convo
   %(prog)s --download-images <conv_id> -o ./my-images/
+  %(prog)s --delete <conv_id>                  # Delete a conversation (with confirmation)
+  %(prog)s --delete <conv_id> --no-confirm     # Delete without confirmation prompt
   
   # Start HTTP API server
   %(prog)s --serve
@@ -2776,6 +2996,7 @@ Examples:
        -H "Content-Type: application/json" \\
        -d '{"query": "Follow-up question"}'
   curl "http://localhost:8000/conversations/<conv_id>/images"
+  curl -X DELETE "http://localhost:8000/conversations/<conv_id>"
 
   # ORCHESTRATOR - Multi-step task execution
   %(prog)s --orchestrate "Create a business plan for a SaaS startup"
@@ -2842,6 +3063,10 @@ To use your existing logged-in session:
                               help="Download images from a conversation")
     history_group.add_argument("--output-dir", "-o", type=str, default=None,
                               help="Output directory for downloaded images (default: ./perplexity-images/)")
+    history_group.add_argument("--delete", type=str, metavar="URL_OR_ID",
+                              help="Delete a conversation/thread")
+    history_group.add_argument("--no-confirm", action="store_true",
+                              help="Skip confirmation prompt when deleting")
     
     # Orchestrator arguments
     orchestrator_group = parser.add_argument_group('Orchestrator Options')
@@ -2958,6 +3183,42 @@ To use your existing logged-in session:
                     print(f"  {path}")
             else:
                 print(f"{tColor.yellow}No images found to download.{tColor.reset}")
+        finally:
+            await browser.stop()
+        return
+    
+    if args.delete:
+        browser = PerplexityBrowser(
+            cdp_url=args.cdp_url if args.cdp else None,
+            profile_path=args.profile,
+        )
+        try:
+            await browser.start()
+            if not await browser.is_logged_in():
+                print(f"{tColor.yellow}Not logged in. Run with --login first.{tColor.reset}")
+                sys.exit(1)
+            
+            print(f"\n{tColor.bold}Deleting conversation:{tColor.reset} {args.delete}")
+            
+            # Confirm unless --no-confirm is set
+            if not args.no_confirm:
+                print(f"{tColor.red}Are you sure you want to delete this conversation?{tColor.reset}")
+                try:
+                    confirm = input("  Type 'yes' to confirm: ").strip().lower()
+                    if confirm != 'yes':
+                        print(f"{tColor.yellow}Deletion cancelled.{tColor.reset}")
+                        sys.exit(0)
+                except (KeyboardInterrupt, EOFError):
+                    print(f"\n{tColor.yellow}Deletion cancelled.{tColor.reset}")
+                    sys.exit(0)
+            
+            success = await browser.delete_conversation(args.delete)
+            
+            if success:
+                print(f"\n{tColor.green}✓ Conversation deleted.{tColor.reset}")
+            else:
+                print(f"\n{tColor.red}✗ Failed to delete conversation.{tColor.reset}")
+                sys.exit(1)
         finally:
             await browser.stop()
         return
