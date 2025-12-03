@@ -22,6 +22,7 @@ Usage:
 from .core import (
     PerplexityBrowser,
     PerplexityResponse,
+    Conversation,
     TaskOrchestrator,
     SubTask,
     AVAILABLE_MODELS,
@@ -31,6 +32,7 @@ from .core import (
 __all__ = [
     "PerplexityBrowser",
     "PerplexityResponse",
+    "Conversation",
     "TaskOrchestrator",
     "SubTask",
     "AVAILABLE_MODELS",

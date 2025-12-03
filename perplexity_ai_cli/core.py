@@ -28,6 +28,7 @@ __version__ = "1.1.0"
 __all__ = [
     "PerplexityBrowser",
     "PerplexityResponse", 
+    "Conversation",
     "TaskOrchestrator",
     "SubTask",
     "AVAILABLE_MODELS",
@@ -73,6 +74,21 @@ class PerplexityResponse:
     query: str
     model: Optional[str] = None
     raw_html: Optional[str] = None
+    images: List[str] = field(default_factory=list)  # Generated image URLs
+    conversation_url: Optional[str] = None  # URL of the conversation
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class Conversation:
+    """Represents a Perplexity conversation from history."""
+    id: str  # Conversation ID extracted from URL
+    url: str  # Full URL to the conversation
+    title: str  # Title/first query of the conversation
+    timestamp: Optional[str] = None  # When the conversation was created/updated
+    preview: Optional[str] = None  # Preview of the conversation content
     
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -422,6 +438,7 @@ class PerplexityBrowser:
         labs_mode: bool = False,
         timeout: int = 60,
         use_paste: bool = False,
+        with_thinking: bool = False,
     ) -> PerplexityResponse:
         """
         Ask a question and get the response.
@@ -435,6 +452,7 @@ class PerplexityBrowser:
             labs_mode: Use Labs mode for experimental features.
             timeout: Maximum seconds to wait for response.
             use_paste: Use clipboard paste instead of typing (faster, preserves newlines).
+            with_thinking: Enable extended thinking mode (shows reasoning process).
         
         Returns:
             PerplexityResponse with answer and references.
@@ -486,11 +504,17 @@ class PerplexityBrowser:
         if model and model != "auto":
             await self._select_model(model)
         
+        if with_thinking:
+            await self._enable_thinking_mode()
+        
         if pro_mode and not model:
             await self._enable_pro_mode()
         
         if focus and focus != "internet":
             await self._select_focus(focus)
+        
+        # Ensure any dropdowns/overlays are closed before typing
+        await self._dismiss_overlays()
         
         # Click input again to ensure focus for typing
         await input_element.click()
@@ -523,11 +547,19 @@ class PerplexityBrowser:
         response_text = await self._wait_for_response(effective_timeout)
         references = await self._extract_references()
         
+        # Check for and wait for any image generation
+        images = await self._wait_for_images(timeout=120)
+        
+        # Capture the conversation URL for future reference
+        conversation_url = self._page.url if self._page else None
+        
         return PerplexityResponse(
             answer=response_text,
             references=references,
             query=query,
             model=model,
+            images=images,
+            conversation_url=conversation_url,
         )
     
     async def _select_search_mode(self, mode: str):
@@ -653,8 +685,34 @@ class PerplexityBrowser:
             print(f"    Model selected: {model_display_name}")
         else:
             print(f"    Warning: Could not find model option for '{model_display_name}'")
-            # Press Escape to close dropdown
+        
+        # Always ensure dropdown/overlay is closed
+        await self._dismiss_overlays()
+    
+    async def _dismiss_overlays(self):
+        """Dismiss any open dropdowns, modals, or overlays that might block clicks."""
+        try:
+            # Press Escape to close any open dropdown/modal
             await self._page.keyboard.press("Escape")
+            await asyncio.sleep(0.2)
+            
+            # Click on the main content area to dismiss popups
+            # Try clicking on the main element or body
+            main = await self._page.query_selector('main')
+            if main:
+                # Get the bounding box and click in a safe area
+                box = await main.bounding_box()
+                if box:
+                    # Click near the top-left of main content
+                    await self._page.mouse.click(box['x'] + 50, box['y'] + 50)
+                    await asyncio.sleep(0.1)
+            
+            # Press Escape again just in case
+            await self._page.keyboard.press("Escape")
+            await asyncio.sleep(0.1)
+        except Exception:
+            # Silently ignore - this is a best-effort cleanup
+            pass
     
     async def _enable_pro_mode(self):
         """Enable Pro/Copilot mode if available."""
@@ -682,6 +740,56 @@ class PerplexityBrowser:
         
         print("  Note: Pro mode toggle not found (may already be enabled or unavailable)")
     
+    async def _enable_thinking_mode(self):
+        """Enable 'With Thinking' mode if available in the model dropdown."""
+        print("  Enabling thinking mode...")
+        
+        # The thinking toggle appears in the model dropdown or as a separate toggle
+        # Look for buttons/switches with "thinking" in their text or aria-label
+        thinking_selectors = [
+            '[data-testid="thinking-toggle"]',
+            'button[aria-label*="thinking" i]',
+            'button[aria-label*="Thinking" i]',
+            '[role="switch"][aria-label*="thinking" i]',
+            '[role="menuitemcheckbox"]:has-text("thinking")',
+            'label:has-text("With Thinking")',
+            'span:text-is("With Thinking")',
+            'button:has-text("With Thinking")',
+        ]
+        
+        for selector in thinking_selectors:
+            try:
+                toggle = await self._page.query_selector(selector)
+                if toggle:
+                    # Check if it's already enabled
+                    is_checked = await toggle.get_attribute("aria-checked")
+                    data_state = await toggle.get_attribute("data-state")
+                    
+                    if is_checked != "true" and data_state != "checked":
+                        await toggle.click()
+                        await asyncio.sleep(0.3)
+                        print("    Thinking mode enabled")
+                    else:
+                        print("    Thinking mode already enabled")
+                    return True
+            except Exception as e:
+                continue
+        
+        # Try clicking on text that says "With Thinking" directly
+        try:
+            thinking_text = await self._page.query_selector('text="With Thinking"')
+            if thinking_text:
+                await thinking_text.click()
+                await asyncio.sleep(0.3)
+                print("    Thinking mode enabled via text click")
+                return True
+        except:
+            pass
+        
+        print("    Warning: Thinking mode toggle not found")
+        return False
+
+
     async def _select_focus(self, focus: str):
         """Select a specific focus mode."""
         focus_selectors = [
@@ -824,6 +932,535 @@ class PerplexityBrowser:
                     continue
         
         return references
+    
+    async def _is_image_generating(self) -> bool:
+        """Check if an AI image is currently being generated (not source images loading)."""
+        # Look for SPECIFIC image generation indicators - not general loading
+        # Perplexity shows a distinct UI when generating images with DALL-E/etc.
+        generation_selectors = [
+            # Specific generation status text
+            '[class*="generating"]:has-text("generating")',
+            '[class*="generating"]:has-text("Creating")',
+            # Image generation specific containers
+            '[data-testid*="image-generation"]',
+            '[class*="image-generation"]',
+            # The actual generation progress indicator (not source loading)
+            '[class*="generation-progress"]',
+        ]
+        
+        for selector in generation_selectors:
+            try:
+                element = await self._page.query_selector(selector)
+                if element and await element.is_visible():
+                    return True
+            except:
+                continue
+        
+        # Also check for specific text content indicating generation
+        try:
+            page_text = await self._page.inner_text('main')
+            generation_phrases = [
+                'Generating image',
+                'Creating image',
+                'Image is being generated',
+                'generating your image',
+            ]
+            for phrase in generation_phrases:
+                if phrase.lower() in page_text.lower():
+                    return True
+        except:
+            pass
+        
+        return False
+    
+    async def _wait_for_images(self, timeout: int = 60) -> List[str]:
+        """Wait for AI-generated images if generation is in progress."""
+        # Quick check - only wait if we detect active image generation
+        is_generating = await self._is_image_generating()
+        
+        if not is_generating:
+            # No active generation detected, skip waiting
+            return []
+        
+        print("  Waiting for image generation...")
+        start_time = asyncio.get_event_loop().time()
+        
+        # Wait for generation to complete
+        while await self._is_image_generating():
+            if asyncio.get_event_loop().time() - start_time > timeout:
+                print("  Warning: Image generation timed out")
+                break
+            await asyncio.sleep(2)
+        
+        # Give the image a moment to fully load after generation completes
+        await asyncio.sleep(3)
+        
+        # Extract the generated images
+        images = await self._extract_generated_images()
+        
+        if images:
+            print(f"  Found {len(images)} AI-generated image(s)")
+        
+        return images
+    
+    async def _extract_generated_images(self) -> List[str]:
+        """Extract URLs of AI-generated images (not source thumbnails)."""
+        images = []
+        seen_urls = set()
+        
+        # AI-generated images have specific characteristics:
+        # - Larger than thumbnails (typically 512x512 or larger)
+        # - Often in specific containers
+        # - Have specific URL patterns from image generation services
+        
+        # First, look for images in known AI-generation containers
+        ai_image_selectors = [
+            # Perplexity's generated image containers
+            '[class*="generated-image"] img',
+            '[data-testid*="generated"] img',
+            '[class*="ai-image"] img',
+            # Images with generation-specific alt text
+            'img[alt*="Generated"]',
+            'img[alt*="DALL"]',
+            'img[alt*="Midjourney"]',
+            'img[alt*="Stable Diffusion"]',
+        ]
+        
+        for selector in ai_image_selectors:
+            try:
+                img_elements = await self._page.query_selector_all(selector)
+                for img in img_elements:
+                    try:
+                        src = await img.get_attribute("src")
+                        if src and src not in seen_urls:
+                            seen_urls.add(src)
+                            images.append(src)
+                    except:
+                        continue
+            except:
+                continue
+        
+        # If we found images in AI containers, return them
+        if images:
+            return images
+        
+        # Fallback: Look for large images that might be generated
+        # Only in the prose/answer area, and filter strictly
+        try:
+            prose_images = await self._page.query_selector_all('.prose img')
+            for img in prose_images:
+                try:
+                    src = await img.get_attribute("src")
+                    if not src or src in seen_urls:
+                        continue
+                    
+                    # Check dimensions - AI images are typically large (400x400+)
+                    width = await img.evaluate("el => el.naturalWidth || el.width")
+                    height = await img.evaluate("el => el.naturalHeight || el.height")
+                    
+                    # Only include large images (likely AI-generated, not thumbnails)
+                    if width and height and int(width) >= 400 and int(height) >= 400:
+                        # Skip URLs that look like source thumbnails/favicons
+                        skip_patterns = [
+                            'favicon', 'icon', 'logo', 'avatar', 'profile', 'emoji',
+                            'thumbnail', 'thumb', 'small', 'tiny',
+                            'google.com', 'facebook.com', 'twitter.com', 'linkedin.com',
+                            'gravatar', 'githubusercontent',
+                        ]
+                        if not any(p in src.lower() for p in skip_patterns):
+                            seen_urls.add(src)
+                            images.append(src)
+                except:
+                    continue
+        except:
+            pass
+        
+        return images
+    
+    # -------------------------------------------------------------------------
+    # Conversation History & Navigation
+    # -------------------------------------------------------------------------
+    
+    async def list_conversations(self, limit: int = 20) -> List[Conversation]:
+        """
+        List recent conversations from Perplexity's library/history.
+        
+        Args:
+            limit: Maximum number of conversations to retrieve.
+        
+        Returns:
+            List of Conversation objects with id, url, title, etc.
+        """
+        await self.start()
+        
+        # Navigate to library/history page
+        print("  Fetching conversation history...")
+        await self._page.goto(f"{self.PERPLEXITY_URL}/library", wait_until="domcontentloaded", timeout=60000)
+        await asyncio.sleep(3)
+        
+        conversations = []
+        
+        # Look for conversation items in the library
+        # Perplexity shows threads as cards/list items with links
+        conversation_selectors = [
+            '[data-testid="thread-item"] a',
+            '[class*="thread"] a[href*="/search/"]',
+            'a[href*="/search/"]',
+            '[class*="library"] a[href*="/search/"]',
+            '[class*="history"] a[href*="/search/"]',
+        ]
+        
+        seen_urls = set()
+        for selector in conversation_selectors:
+            try:
+                items = await self._page.query_selector_all(selector)
+                for item in items:
+                    if len(conversations) >= limit:
+                        break
+                    
+                    try:
+                        href = await item.get_attribute("href")
+                        if not href or href in seen_urls:
+                            continue
+                        
+                        # Extract conversation ID from URL
+                        # URLs look like: /search/conversation-title-abc123
+                        if "/search/" in href:
+                            seen_urls.add(href)
+                            
+                            # Get full URL
+                            full_url = href if href.startswith("http") else f"{self.PERPLEXITY_URL}{href}"
+                            
+                            # Extract ID (last part of URL path)
+                            conv_id = href.split("/search/")[-1].split("?")[0]
+                            
+                            # Try to get title from the element
+                            title = await item.inner_text()
+                            title = title.strip()[:100] if title else conv_id
+                            
+                            # Try to get timestamp if available
+                            timestamp = None
+                            parent = await item.evaluate_handle("el => el.closest('[data-testid=\"thread-item\"]') || el.parentElement")
+                            if parent:
+                                try:
+                                    time_el = await parent.query_selector('time, [class*="time"], [class*="date"]')
+                                    if time_el:
+                                        timestamp = await time_el.inner_text()
+                                except:
+                                    pass
+                            
+                            conversations.append(Conversation(
+                                id=conv_id,
+                                url=full_url,
+                                title=title,
+                                timestamp=timestamp,
+                            ))
+                    except Exception as e:
+                        continue
+                
+                if conversations:
+                    break  # Found conversations with this selector
+            except:
+                continue
+        
+        print(f"  Found {len(conversations)} conversation(s)")
+        return conversations
+    
+    async def open_conversation(self, url_or_id: str) -> Optional[PerplexityResponse]:
+        """
+        Navigate to and load a specific conversation.
+        
+        Args:
+            url_or_id: Either a full URL or a conversation ID.
+        
+        Returns:
+            PerplexityResponse with the conversation content, or None if not found.
+        """
+        await self.start()
+        
+        # Build URL if only ID provided
+        if url_or_id.startswith("http"):
+            url = url_or_id
+        else:
+            url = f"{self.PERPLEXITY_URL}/search/{url_or_id}"
+        
+        print(f"  Opening conversation: {url}")
+        
+        try:
+            await self._page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            await asyncio.sleep(3)
+        except Exception as e:
+            print(f"  Error navigating to conversation: {e}")
+            return None
+        
+        # Extract the conversation content
+        response_text = await self._extract_response_text()
+        references = await self._extract_references()
+        images = await self._extract_generated_images()
+        
+        # Try to get the original query from the page
+        query = ""
+        try:
+            # Look for the user's query in the conversation
+            query_selectors = [
+                '[data-testid="user-query"]',
+                '[class*="user-message"]',
+                '[class*="query-text"]',
+            ]
+            for selector in query_selectors:
+                el = await self._page.query_selector(selector)
+                if el:
+                    query = await el.inner_text()
+                    break
+            
+            # Fallback: use page title
+            if not query:
+                query = await self._page.title()
+        except:
+            pass
+        
+        return PerplexityResponse(
+            answer=response_text,
+            references=references,
+            query=query.strip(),
+            images=images,
+            conversation_url=url,
+        )
+    
+    async def continue_conversation(
+        self,
+        url_or_id: str,
+        query: str,
+        model: Optional[str] = None,
+        with_thinking: bool = False,
+        timeout: int = 60,
+        use_paste: bool = False,
+    ) -> PerplexityResponse:
+        """
+        Continue an existing conversation with a follow-up question.
+        
+        Args:
+            url_or_id: Either a full URL or a conversation ID.
+            query: The follow-up question to ask.
+            model: Specific model to use for the response.
+            with_thinking: Enable extended thinking mode.
+            timeout: Maximum seconds to wait for response.
+            use_paste: Use clipboard paste instead of typing.
+        
+        Returns:
+            PerplexityResponse with the new answer.
+        """
+        await self.start()
+        
+        # Build URL if only ID provided
+        if url_or_id.startswith("http"):
+            url = url_or_id
+        else:
+            url = f"{self.PERPLEXITY_URL}/search/{url_or_id}"
+        
+        print(f"  Continuing conversation: {url}")
+        
+        # Navigate to the conversation
+        await self._page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        await asyncio.sleep(3)
+        
+        # Find the follow-up input
+        input_selectors = [
+            '[data-testid="follow-up-input"]',
+            '#follow-up-input',
+            '[placeholder*="follow"]',
+            '[placeholder*="Follow"]',
+            '#ask-input',
+            '[role="textbox"][contenteditable="true"]',
+        ]
+        
+        input_element = None
+        for selector in input_selectors:
+            try:
+                await self._page.wait_for_selector(selector, timeout=5000)
+                input_element = await self._page.query_selector(selector)
+                if input_element:
+                    print(f"  Found follow-up input with selector: {selector}")
+                    break
+            except:
+                continue
+        
+        if not input_element:
+            raise RuntimeError("Could not find follow-up input. Conversation may not have loaded correctly.")
+        
+        # Click to focus
+        await input_element.click()
+        await asyncio.sleep(0.5)
+        
+        # Select model if specified
+        if model and model != "auto":
+            await self._select_model(model)
+        
+        if with_thinking:
+            await self._enable_thinking_mode()
+        
+        # Dismiss overlays and refocus
+        await self._dismiss_overlays()
+        await input_element.click()
+        await asyncio.sleep(0.2)
+        
+        # Type the query
+        if use_paste:
+            await self._page.evaluate(f"navigator.clipboard.writeText({json.dumps(query)})")
+            await asyncio.sleep(0.1)
+            await self._page.keyboard.press("Control+v")
+            await asyncio.sleep(0.3)
+        else:
+            await self._page.keyboard.type(query, delay=20)
+        
+        await asyncio.sleep(0.5)
+        
+        # Submit
+        await self._page.keyboard.press("Enter")
+        print(f"  Follow-up submitted, waiting for response...")
+        
+        # Wait for response
+        response_text = await self._wait_for_response(timeout)
+        references = await self._extract_references()
+        images = await self._wait_for_images(timeout=120)
+        
+        return PerplexityResponse(
+            answer=response_text,
+            references=references,
+            query=query,
+            model=model,
+            images=images,
+            conversation_url=self._page.url,
+        )
+    
+    async def download_images(
+        self,
+        url_or_id: Optional[str] = None,
+        output_dir: Optional[Path] = None,
+    ) -> List[Path]:
+        """
+        Download images from a conversation (or current page).
+        
+        Args:
+            url_or_id: Conversation URL or ID. If None, uses current page.
+            output_dir: Directory to save images. Defaults to ./perplexity-images/
+        
+        Returns:
+            List of paths to downloaded images.
+        """
+        import aiohttp
+        
+        await self.start()
+        
+        # Navigate if URL provided
+        if url_or_id:
+            if url_or_id.startswith("http"):
+                url = url_or_id
+            else:
+                url = f"{self.PERPLEXITY_URL}/search/{url_or_id}"
+            
+            print(f"  Loading conversation for image download: {url}")
+            await self._page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            await asyncio.sleep(3)
+        
+        # Set up output directory
+        if output_dir is None:
+            output_dir = Path("./perplexity-images")
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Extract all images from the page
+        images = await self._extract_generated_images()
+        
+        # Also look for any other large images that might be relevant
+        try:
+            all_imgs = await self._page.query_selector_all('img')
+            for img in all_imgs:
+                try:
+                    src = await img.get_attribute("src")
+                    if not src or src in images:
+                        continue
+                    
+                    # Check dimensions
+                    width = await img.evaluate("el => el.naturalWidth || el.width")
+                    height = await img.evaluate("el => el.naturalHeight || el.height")
+                    
+                    if width and height and int(width) >= 256 and int(height) >= 256:
+                        # Skip known non-AI image patterns
+                        skip_patterns = ['favicon', 'icon', 'logo', 'avatar', 'profile', 'emoji', 'data:']
+                        if not any(p in src.lower() for p in skip_patterns):
+                            images.append(src)
+                except:
+                    continue
+        except:
+            pass
+        
+        if not images:
+            print("  No images found to download")
+            return []
+        
+        print(f"  Found {len(images)} image(s) to download")
+        
+        downloaded = []
+        async with aiohttp.ClientSession() as session:
+            for i, img_url in enumerate(images, 1):
+                try:
+                    # Handle data URLs
+                    if img_url.startswith("data:"):
+                        import base64
+                        # Parse data URL
+                        header, data = img_url.split(",", 1)
+                        mime_type = header.split(";")[0].split(":")[1]
+                        ext = mime_type.split("/")[1]
+                        if ext == "jpeg":
+                            ext = "jpg"
+                        
+                        filename = f"image_{i:03d}.{ext}"
+                        filepath = output_dir / filename
+                        
+                        img_data = base64.b64decode(data)
+                        with open(filepath, "wb") as f:
+                            f.write(img_data)
+                        
+                        downloaded.append(filepath)
+                        print(f"    [{i}/{len(images)}] Saved: {filename}")
+                        continue
+                    
+                    # Download from URL
+                    async with session.get(img_url) as resp:
+                        if resp.status == 200:
+                            # Determine extension from content type or URL
+                            content_type = resp.headers.get("Content-Type", "")
+                            if "jpeg" in content_type or "jpg" in content_type:
+                                ext = "jpg"
+                            elif "png" in content_type:
+                                ext = "png"
+                            elif "gif" in content_type:
+                                ext = "gif"
+                            elif "webp" in content_type:
+                                ext = "webp"
+                            else:
+                                # Try to get from URL
+                                ext = img_url.split(".")[-1].split("?")[0][:4]
+                                if ext not in ["jpg", "jpeg", "png", "gif", "webp"]:
+                                    ext = "png"
+                            
+                            filename = f"image_{i:03d}.{ext}"
+                            filepath = output_dir / filename
+                            
+                            img_data = await resp.read()
+                            with open(filepath, "wb") as f:
+                                f.write(img_data)
+                            
+                            downloaded.append(filepath)
+                            print(f"    [{i}/{len(images)}] Saved: {filename}")
+                        else:
+                            print(f"    [{i}/{len(images)}] Failed to download (HTTP {resp.status})")
+                except Exception as e:
+                    print(f"    [{i}/{len(images)}] Error: {e}")
+        
+        print(f"  Downloaded {len(downloaded)} image(s) to {output_dir}")
+        return downloaded
 
 
 # ---------------------------------------------------------------------------
@@ -1565,6 +2202,7 @@ if FastAPI:
         model: Optional[str] = None  # Model selection (e.g., "gpt-4o", "claude-sonnet", "sonar")
         research_mode: bool = False  # Deep research mode
         labs_mode: bool = False  # Labs mode for experimental features
+        with_thinking: bool = False  # Enable extended thinking mode
         timeout: int = 60
     
     class QueryResponse(BaseModel):
@@ -1572,6 +2210,21 @@ if FastAPI:
         references: List[Dict[str, str]]
         query: str
         model: Optional[str] = None
+        images: List[str] = []
+        conversation_url: Optional[str] = None
+    
+    class ConversationInfo(BaseModel):
+        id: str
+        url: str
+        title: str
+        timestamp: Optional[str] = None
+        preview: Optional[str] = None
+    
+    class ContinueRequest(BaseModel):
+        query: str
+        model: Optional[str] = None
+        with_thinking: bool = False
+        timeout: int = 60
     
     @app.get("/health")
     async def health():
@@ -1607,8 +2260,16 @@ if FastAPI:
                 research_mode=request.research_mode,
                 labs_mode=request.labs_mode,
                 timeout=request.timeout,
+                with_thinking=request.with_thinking,
             )
-            return QueryResponse(**response.to_dict())
+            return QueryResponse(
+                answer=response.answer,
+                references=response.references,
+                query=response.query,
+                model=response.model,
+                images=response.images,
+                conversation_url=response.conversation_url,
+            )
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
     
@@ -1650,6 +2311,105 @@ if FastAPI:
             "models": list(AVAILABLE_MODELS.keys()),
             "descriptions": AVAILABLE_MODELS,
         }
+    
+    @app.get("/conversations", response_model=List[ConversationInfo])
+    async def list_conversations(limit: int = 20):
+        """List recent conversations from history."""
+        if not _browser:
+            raise HTTPException(status_code=503, detail="Browser not initialized")
+        
+        if not await _browser.is_logged_in():
+            raise HTTPException(status_code=401, detail="Not logged in")
+        
+        try:
+            conversations = await _browser.list_conversations(limit=limit)
+            return [ConversationInfo(**c.to_dict()) for c in conversations]
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.get("/conversations/{conv_id}", response_model=QueryResponse)
+    async def get_conversation(conv_id: str):
+        """Get a specific conversation by ID or URL."""
+        if not _browser:
+            raise HTTPException(status_code=503, detail="Browser not initialized")
+        
+        if not await _browser.is_logged_in():
+            raise HTTPException(status_code=401, detail="Not logged in")
+        
+        try:
+            response = await _browser.open_conversation(conv_id)
+            if not response:
+                raise HTTPException(status_code=404, detail="Conversation not found")
+            return QueryResponse(
+                answer=response.answer,
+                references=response.references,
+                query=response.query,
+                model=response.model,
+                images=response.images,
+                conversation_url=response.conversation_url,
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.post("/conversations/{conv_id}/continue", response_model=QueryResponse)
+    async def continue_conversation(conv_id: str, request: ContinueRequest):
+        """Continue a conversation with a follow-up question."""
+        if not _browser:
+            raise HTTPException(status_code=503, detail="Browser not initialized")
+        
+        if not await _browser.is_logged_in():
+            raise HTTPException(status_code=401, detail="Not logged in")
+        
+        # Validate model if provided
+        if request.model and request.model not in AVAILABLE_MODELS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid model '{request.model}'. Available: {', '.join(AVAILABLE_MODELS.keys())}"
+            )
+        
+        try:
+            response = await _browser.continue_conversation(
+                conv_id,
+                request.query,
+                model=request.model,
+                with_thinking=request.with_thinking,
+                timeout=request.timeout,
+            )
+            return QueryResponse(
+                answer=response.answer,
+                references=response.references,
+                query=response.query,
+                model=response.model,
+                images=response.images,
+                conversation_url=response.conversation_url,
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.get("/conversations/{conv_id}/images")
+    async def get_conversation_images(conv_id: str):
+        """Get images from a conversation."""
+        if not _browser:
+            raise HTTPException(status_code=503, detail="Browser not initialized")
+        
+        if not await _browser.is_logged_in():
+            raise HTTPException(status_code=401, detail="Not logged in")
+        
+        try:
+            response = await _browser.open_conversation(conv_id)
+            if not response:
+                raise HTTPException(status_code=404, detail="Conversation not found")
+            return {
+                "conversation_url": response.conversation_url,
+                "images": response.images,
+                "count": len(response.images),
+            }
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 # ---------------------------------------------------------------------------
@@ -1702,6 +2462,7 @@ async def cli_ask(
     labs_mode: bool = False,
     focus: str = "internet",
     use_paste: bool = False,
+        with_thinking: bool = False,
 ):
     """CLI: Ask a single question."""
     mode_info = []
@@ -1726,6 +2487,7 @@ async def cli_ask(
             labs_mode=labs_mode,
             focus=focus,
             use_paste=use_paste,
+            with_thinking=with_thinking,
         )
         render_answer(response.answer, typing_delay=typing_delay)
         if show_refs:
@@ -1743,6 +2505,7 @@ async def cli_interactive(
     labs_mode: bool = False,
     focus: str = "internet",
     use_paste: bool = False,
+    with_thinking: bool = False,
 ):
     """CLI: Interactive mode."""
     print(f"{tColor.bold}Perplexity AI Bridge{tColor.reset} - Interactive Mode")
@@ -1755,24 +2518,30 @@ async def cli_interactive(
         settings.append("Labs Mode")
     elif research_mode:
         settings.append("Research Mode")
+    if with_thinking:
+        settings.append("Thinking")
     if focus != "internet":
         settings.append(f"Focus: {focus}")
     if settings:
         print(f"Settings: {', '.join(settings)}")
     
     print("Type your question and press Enter. Type 'exit' to quit.")
-    print("Commands: /model <name>, /research, /labs, /focus <mode>, /help\n")
+    print("Commands: /model, /thinking, /research, /labs, /focus, /history, /open, /continue, /download, /help\n")
     
     current_model = model
     current_research = research_mode
     current_labs = labs_mode
     current_focus = focus
+    current_thinking = with_thinking
+    last_conversation_url = None
     
     while True:
         try:
             prompt_parts = []
             if current_model:
                 prompt_parts.append(f"{tColor.aqua}{current_model}{tColor.reset}")
+            if current_thinking:
+                prompt_parts.append(f"{tColor.green}T{tColor.reset}")
             if current_labs:
                 prompt_parts.append(f"{tColor.yellow}L{tColor.reset}")
             elif current_research:
@@ -1799,6 +2568,9 @@ async def cli_interactive(
                         print(f"  Model set to: {AVAILABLE_MODELS.get(arg, arg) or 'auto'}")
                     else:
                         print(f"  Available models: {', '.join(AVAILABLE_MODELS.keys())}")
+                elif cmd == "/thinking":
+                    current_thinking = not current_thinking
+                    print(f"  Thinking mode: {'ON' if current_thinking else 'OFF'}")
                 elif cmd == "/research":
                     current_research = not current_research
                     if current_research:
@@ -1815,12 +2587,82 @@ async def cli_interactive(
                         print(f"  Focus set to: {current_focus}")
                     else:
                         print("  Available: internet, academic, writing, wolfram, youtube, reddit")
+                elif cmd == "/history":
+                    print(f"\n{tColor.lavand}Fetching conversation history...{tColor.reset}")
+                    conversations = await browser.list_conversations(limit=10)
+                    if conversations:
+                        for i, conv in enumerate(conversations, 1):
+                            print(f"  {tColor.aqua}[{i}]{tColor.reset} {conv.title[:50]}")
+                            print(f"      ID: {conv.id}")
+                    else:
+                        print("  No conversations found.")
+                    print(f"\n{tColor.lavand}Use /open <id> or /continue <id> <question>{tColor.reset}")
+                elif cmd == "/open":
+                    if arg:
+                        print(f"\n{tColor.lavand}Opening conversation...{tColor.reset}")
+                        response = await browser.open_conversation(arg)
+                        if response:
+                            last_conversation_url = response.conversation_url
+                            render_answer(response.answer, typing_delay=typing_delay)
+                            render_references(response.references)
+                            if response.images:
+                                print(f"\n{tColor.lavand}Images: {len(response.images)} found. Use /download to save.{tColor.reset}")
+                        else:
+                            print(f"  {tColor.red}Could not load conversation.{tColor.reset}")
+                    else:
+                        print("  Usage: /open <conversation_id>")
+                elif cmd == "/continue":
+                    parts = arg.split(maxsplit=1)
+                    if len(parts) >= 2:
+                        conv_id, follow_up = parts
+                        print(f"\n{tColor.lavand}Continuing conversation...{tColor.reset}")
+                        response = await browser.continue_conversation(
+                            conv_id, follow_up,
+                            model=current_model,
+                            with_thinking=current_thinking,
+                            use_paste=use_paste,
+                        )
+                        last_conversation_url = response.conversation_url
+                        render_answer(response.answer, typing_delay=typing_delay)
+                        render_references(response.references)
+                    elif last_conversation_url and arg:
+                        # Continue last opened conversation
+                        print(f"\n{tColor.lavand}Continuing last conversation...{tColor.reset}")
+                        response = await browser.continue_conversation(
+                            last_conversation_url, arg,
+                            model=current_model,
+                            with_thinking=current_thinking,
+                            use_paste=use_paste,
+                        )
+                        last_conversation_url = response.conversation_url
+                        render_answer(response.answer, typing_delay=typing_delay)
+                        render_references(response.references)
+                    else:
+                        print("  Usage: /continue <conversation_id> <follow-up question>")
+                        print("  Or open a conversation first with /open, then: /continue <question>")
+                elif cmd == "/download":
+                    target = arg if arg else last_conversation_url
+                    if target:
+                        print(f"\n{tColor.lavand}Downloading images...{tColor.reset}")
+                        downloaded = await browser.download_images(target)
+                        if downloaded:
+                            print(f"  {tColor.green}Downloaded {len(downloaded)} image(s){tColor.reset}")
+                        else:
+                            print(f"  {tColor.yellow}No images found to download.{tColor.reset}")
+                    else:
+                        print("  Usage: /download <conversation_id>")
+                        print("  Or open a conversation first with /open, then just: /download")
                 elif cmd == "/help":
-                    print("  /model <name>  - Set model (e.g., gpt-4o, claude-sonnet)")
-                    print("  /research      - Toggle research mode")
-                    print("  /labs          - Toggle labs mode")
-                    print("  /focus <mode>  - Set focus (internet, academic, etc.)")
-                    print("  /help          - Show this help")
+                    print("  /model <name>   - Set model (e.g., gpt, claude-sonnet)")
+                    print("  /thinking       - Toggle thinking mode (shows reasoning)")
+                    print("  /research       - Toggle research mode")
+                    print("  /labs           - Toggle labs mode")
+                    print("  /focus <mode>   - Set focus (internet, academic, etc.)")
+                    print("  /history        - List recent conversations")
+                    print("  /open <id>      - Open a previous conversation")
+                    print("  /continue <id> <q> - Continue a conversation")
+                    print("  /download [id]  - Download images from conversation")
+                    print("  /help           - Show this help")
                 else:
                     print(f"  Unknown command: {cmd}")
                 continue
@@ -1832,9 +2674,15 @@ async def cli_interactive(
                 labs_mode=current_labs,
                 focus=current_focus,
                 use_paste=use_paste,
+                with_thinking=current_thinking,
             )
+            last_conversation_url = response.conversation_url
             render_answer(response.answer, typing_delay=typing_delay)
             render_references(response.references)
+            
+            if response.images:
+                print(f"\n{tColor.lavand}Images generated: {len(response.images)}{tColor.reset}")
+            
             print()
             
         except KeyboardInterrupt:
@@ -1880,6 +2728,10 @@ Examples:
   %(prog)s --model gpt-4o "Explain relativity"
   %(prog)s -m claude-sonnet "Write a poem"
   
+  # Enable thinking mode (shows model's reasoning process)
+  %(prog)s -m claude -t "Solve this complex problem"
+  %(prog)s --model gpt --with-thinking "Analyze this data"
+  
   # Use Research mode for deep research
   %(prog)s --research "History of quantum computing"
   %(prog)s -r "Compare modern AI architectures"
@@ -1901,6 +2753,13 @@ Examples:
   # Login in new browser profile
   %(prog)s --login
   
+  # CONVERSATION HISTORY
+  %(prog)s --history                           # List recent conversations
+  %(prog)s --open <conv_id>                    # View a previous conversation
+  %(prog)s --continue <conv_id> "Follow-up?"   # Continue a conversation
+  %(prog)s --download-images <conv_id>         # Download images from a convo
+  %(prog)s --download-images <conv_id> -o ./my-images/
+  
   # Start HTTP API server
   %(prog)s --serve
   
@@ -1908,7 +2767,15 @@ Examples:
   curl "http://localhost:8000/ask?q=What+is+AI"
   curl "http://localhost:8000/ask?q=Deep+topic&research=true"
   curl "http://localhost:8000/ask?q=Build+a+chart&labs=true"
-  curl "http://localhost:8000/ask?q=Question&model=gpt-4o"
+  curl "http://localhost:8000/ask?q=Question&model=gpt-4o&with_thinking=true"
+  
+  # Conversation history via HTTP:
+  curl "http://localhost:8000/conversations"
+  curl "http://localhost:8000/conversations/<conv_id>"
+  curl -X POST "http://localhost:8000/conversations/<conv_id>/continue" \\
+       -H "Content-Type: application/json" \\
+       -d '{"query": "Follow-up question"}'
+  curl "http://localhost:8000/conversations/<conv_id>/images"
 
   # ORCHESTRATOR - Multi-step task execution
   %(prog)s --orchestrate "Create a business plan for a SaaS startup"
@@ -1953,11 +2820,28 @@ To use your existing logged-in session:
                         help="Use Research mode for deep, multi-step research")
     parser.add_argument("--labs", "-l", action="store_true",
                         help="Use Labs mode for experimental features")
+    parser.add_argument("--with-thinking", "-t", action="store_true",
+                        help="Enable extended thinking mode (shows reasoning process)")
     parser.add_argument("--focus", "-f", type=str, default="internet",
                         choices=["internet", "academic", "writing", "wolfram", "youtube", "reddit"],
                         help="Search focus mode (default: internet)")
     parser.add_argument("--list-models", action="store_true",
                         help="List available models and exit")
+    
+    # Conversation history arguments
+    history_group = parser.add_argument_group('Conversation History')
+    history_group.add_argument("--history", "--list-conversations", action="store_true",
+                              dest="list_conversations",
+                              help="List recent conversations from your library")
+    history_group.add_argument("--continue", "-c", type=str, metavar="URL_OR_ID",
+                              dest="continue_conversation",
+                              help="Continue a previous conversation with a follow-up query")
+    history_group.add_argument("--open", type=str, metavar="URL_OR_ID",
+                              help="Open and display a previous conversation")
+    history_group.add_argument("--download-images", type=str, metavar="URL_OR_ID",
+                              help="Download images from a conversation")
+    history_group.add_argument("--output-dir", "-o", type=str, default=None,
+                              help="Output directory for downloaded images (default: ./perplexity-images/)")
     
     # Orchestrator arguments
     orchestrator_group = parser.add_argument_group('Orchestrator Options')
@@ -1986,6 +2870,134 @@ To use your existing logged-in session:
                 print(f"  {tColor.aqua}{key:20}{tColor.reset} → {name}")
             else:
                 print(f"  {tColor.aqua}{key:20}{tColor.reset} → (auto-select)")
+        return
+    
+    # Conversation history commands
+    if args.list_conversations:
+        browser = PerplexityBrowser(
+            cdp_url=args.cdp_url if args.cdp else None,
+            profile_path=args.profile,
+        )
+        try:
+            await browser.start()
+            if not await browser.is_logged_in():
+                print(f"{tColor.yellow}Not logged in. Run with --login first.{tColor.reset}")
+                sys.exit(1)
+            
+            print(f"\n{tColor.bold}Recent Conversations:{tColor.reset}")
+            print(f"{'─' * 70}")
+            
+            conversations = await browser.list_conversations(limit=20)
+            if conversations:
+                for i, conv in enumerate(conversations, 1):
+                    print(f"\n  {tColor.aqua}[{i}]{tColor.reset} {conv.title[:60]}")
+                    if conv.timestamp:
+                        print(f"      {tColor.lavand}Time:{tColor.reset} {conv.timestamp}")
+                    print(f"      {tColor.blue}URL:{tColor.reset} {conv.url}")
+                    print(f"      {tColor.lavand}ID:{tColor.reset} {conv.id}")
+            else:
+                print("  No conversations found.")
+            
+            print(f"\n{tColor.lavand}Use --continue <ID> or --open <ID> to interact with a conversation.{tColor.reset}")
+        finally:
+            await browser.stop()
+        return
+    
+    if args.open:
+        browser = PerplexityBrowser(
+            cdp_url=args.cdp_url if args.cdp else None,
+            profile_path=args.profile,
+        )
+        try:
+            await browser.start()
+            if not await browser.is_logged_in():
+                print(f"{tColor.yellow}Not logged in. Run with --login first.{tColor.reset}")
+                sys.exit(1)
+            
+            print(f"\n{tColor.bold}Opening conversation:{tColor.reset} {args.open}")
+            
+            response = await browser.open_conversation(args.open)
+            if response:
+                print(f"\n{tColor.bold}Query:{tColor.reset} {response.query}")
+                render_answer(response.answer, typing_delay=0 if args.no_typing else 0.02)
+                render_references(response.references)
+                
+                if response.images:
+                    print(f"\n{tColor.lavand}Images found: {len(response.images)}{tColor.reset}")
+                    for img in response.images:
+                        print(f"  {tColor.blue}{img[:80]}...{tColor.reset}" if len(img) > 80 else f"  {tColor.blue}{img}{tColor.reset}")
+                    print(f"\n{tColor.lavand}Use --download-images {args.open} to download them.{tColor.reset}")
+                
+                print(f"\n{tColor.lavand}Conversation URL:{tColor.reset} {response.conversation_url}")
+            else:
+                print(f"{tColor.red}Could not load conversation.{tColor.reset}")
+                sys.exit(1)
+        finally:
+            await browser.stop()
+        return
+    
+    if args.download_images:
+        browser = PerplexityBrowser(
+            cdp_url=args.cdp_url if args.cdp else None,
+            profile_path=args.profile,
+        )
+        try:
+            await browser.start()
+            if not await browser.is_logged_in():
+                print(f"{tColor.yellow}Not logged in. Run with --login first.{tColor.reset}")
+                sys.exit(1)
+            
+            print(f"\n{tColor.bold}Downloading images from:{tColor.reset} {args.download_images}")
+            
+            output_dir = Path(args.output_dir) if args.output_dir else None
+            downloaded = await browser.download_images(args.download_images, output_dir)
+            
+            if downloaded:
+                print(f"\n{tColor.green}✓ Downloaded {len(downloaded)} image(s):{tColor.reset}")
+                for path in downloaded:
+                    print(f"  {path}")
+            else:
+                print(f"{tColor.yellow}No images found to download.{tColor.reset}")
+        finally:
+            await browser.stop()
+        return
+    
+    if args.continue_conversation:
+        if not args.query:
+            print(f"{tColor.red}Error: --continue requires a query argument.{tColor.reset}")
+            print(f"  Usage: {sys.argv[0]} --continue <URL_OR_ID> \"Your follow-up question\"")
+            sys.exit(1)
+        
+        browser = PerplexityBrowser(
+            cdp_url=args.cdp_url if args.cdp else None,
+            profile_path=args.profile,
+        )
+        try:
+            await browser.start()
+            if not await browser.is_logged_in():
+                print(f"{tColor.yellow}Not logged in. Run with --login first.{tColor.reset}")
+                sys.exit(1)
+            
+            print(f"\n{tColor.bold}Continuing conversation:{tColor.reset} {args.continue_conversation}")
+            print(f"{tColor.bold}Follow-up:{tColor.reset} {args.query}\n")
+            
+            response = await browser.continue_conversation(
+                args.continue_conversation,
+                args.query,
+                model=args.model,
+                with_thinking=args.with_thinking,
+                use_paste=args.paste,
+            )
+            
+            render_answer(response.answer, typing_delay=0 if args.no_typing else 0.02)
+            render_references(response.references)
+            
+            if response.images:
+                print(f"\n{tColor.lavand}New images: {len(response.images)}{tColor.reset}")
+            
+            print(f"\n{tColor.lavand}Updated conversation:{tColor.reset} {response.conversation_url}")
+        finally:
+            await browser.stop()
         return
     
     # List orchestrator runs
@@ -2132,6 +3144,7 @@ To use your existing logged-in session:
                 labs_mode=args.labs,
                 focus=args.focus,
                 use_paste=args.paste,
+                with_thinking=args.with_thinking,
             )
         else:
             # Single query
@@ -2144,6 +3157,7 @@ To use your existing logged-in session:
                 labs_mode=args.labs,
                 focus=args.focus,
                 use_paste=args.paste,
+                with_thinking=args.with_thinking,
             )
     
     finally:
