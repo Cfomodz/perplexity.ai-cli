@@ -2470,9 +2470,15 @@ if FastAPI:
                 detail=f"Invalid model '{request.model}'. Available: {', '.join(AVAILABLE_MODELS.keys())}"
             )
         
+        # Flatten multi-line queries to prevent line breaks from triggering multiple submits
+        query = request.query.replace('\n', ' ').replace('\r', ' ').strip()
+        # Collapse multiple spaces
+        while '  ' in query:
+            query = query.replace('  ', ' ')
+        
         try:
             response = await _browser.ask(
-                query=request.query,
+                query=query,
                 focus=request.focus,
                 pro_mode=request.pro_mode,
                 model=request.model,
@@ -2480,6 +2486,7 @@ if FastAPI:
                 labs_mode=request.labs_mode,
                 timeout=request.timeout,
                 with_thinking=request.with_thinking,
+                use_paste=True,  # Always use paste for API requests
             )
             return QueryResponse(
                 answer=response.answer,
@@ -2588,13 +2595,19 @@ if FastAPI:
                 detail=f"Invalid model '{request.model}'. Available: {', '.join(AVAILABLE_MODELS.keys())}"
             )
         
+        # Flatten multi-line queries
+        query = request.query.replace('\n', ' ').replace('\r', ' ').strip()
+        while '  ' in query:
+            query = query.replace('  ', ' ')
+        
         try:
             response = await _browser.continue_conversation(
                 conv_id,
-                request.query,
+                query,
                 model=request.model,
                 with_thinking=request.with_thinking,
                 timeout=request.timeout,
+                use_paste=True,
             )
             return QueryResponse(
                 answer=response.answer,
